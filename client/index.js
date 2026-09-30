@@ -35,7 +35,7 @@ window.__ModuleLoader__.load({
     }
     const CLIENT_TYPERT_REMOTE = {
       package: REMOTE_PACKAGE,
-      schemas: ['sessionId', 'wait'].map((name) => ({ name, create: () => PASSTHROUGH_SCHEMA })),
+      schemas: ['sessionId', 'wait', 'force'].map((name) => ({ name, create: () => PASSTHROUGH_SCHEMA })),
       descriptors: [
         {
           id: REMOTE_PACKAGE + '#' + REMOTE_NAMESPACE + '/deleteSession',
@@ -46,6 +46,7 @@ window.__ModuleLoader__.load({
           parameters: [
             { name: 'sessionId', wire: 'sessionId', source: 'json', codec: paramCodec('sessionId') },
             { name: 'wait', wire: 'wait', source: 'json', codec: paramCodec('wait') },
+            { name: 'force', wire: 'force', source: 'json', codec: paramCodec('force') },
           ],
           result: { mode: 'src-json' },
         },
@@ -100,10 +101,10 @@ window.__ModuleLoader__.load({
 
     /**
      * shell.overlay 条目：无待确认请求时不渲染，否则一个 Modal。确认后调
-     * host 删除 → 刷新会话列表；live 拒绝时进入二段「停止并删除」；取消
-     * 则原样关闭。
+     * host 删除 → 刷新会话列表；live 拒绝时进入二段「停止并删除」；二段
+     * 超时且会话空闲时进入三段「强制删除」；取消则原样关闭。
      */
-    function SessionDeleteConfirmDialog({ useDeleteRequest, settleSessionDelete, deleteSession, stopAndDelete, isLiveRefusal, t }) {
+    function SessionDeleteConfirmDialog({ useDeleteRequest, settleSessionDelete, deleteSession, stopAndDelete, forceDelete, sessionRunning, isLiveRefusal, t }) {
       const request = useDeleteRequest((pending) => pending)
       if (request === null) return null
       return h(DeleteConfirmForm, {
@@ -112,16 +113,19 @@ window.__ModuleLoader__.load({
         settleSessionDelete,
         deleteSession,
         stopAndDelete,
+        forceDelete,
+        sessionRunning,
         isLiveRefusal,
         t,
       })
     }
 
     /**
-     * 单个请求的对话框：in-flight 与错误状态随其消亡。两段式：
-     * confirm —— 常规确认；live 拒绝后进入 stop —— 「停止并永久删除」。
+     * 单个请求的对话框：in-flight 与错误状态随其消亡。三段式：
+     * confirm —— 常规确认；live 拒绝 → stop —— 「停止并永久删除」；
+     * stop 超时且空闲 → force —— 「强制删除」（跳过占用检查）。
      */
-    function DeleteConfirmForm({ request, settleSessionDelete, deleteSession, stopAndDelete, isLiveRefusal, t }) {
+    function DeleteConfirmForm({ request, settleSessionDelete, deleteSession, stopAndDelete, forceDelete, sessionRunning, isLiveRefusal, t }) {
       const [busy, setBusy] = useState(false)
       const [stage, setStage] = useState('confirm')
       const [error, setError] = useState(null)
@@ -150,9 +154,29 @@ window.__ModuleLoader__.load({
           settleSessionDelete()
         }).catch((reason) => {
           setBusy(false)
+          const message = reason instanceof Error ? reason.message : String(reason)
+          setError(message)
+          // 二段超时且会话空闲 → 提供三段强制删除出口。
+          if (isLiveRefusal(message) && sessionRunning(request.sessionId) === false) setStage('force')
+        })
+      }
+      const forceNow = () => {
+        setBusy(true)
+        setError(null)
+        forceDelete(request.sessionId).then(() => {
+          setBusy(false)
+          settleSessionDelete()
+        }).catch((reason) => {
+          setBusy(false)
           setError(reason instanceof Error ? reason.message : String(reason))
         })
       }
+      const note = stage === 'force' ? t('force.note') : stage === 'stop' ? t('stop.note') : t('confirm.note')
+      const action = stage === 'force'
+        ? h(P.Button, { variant: 'outline', className: 'dsm-danger', disabled: busy, onClick: forceNow }, t('force.action'))
+        : stage === 'stop'
+          ? h(P.Button, { variant: 'outline', className: 'dsm-danger', disabled: busy, onClick: stopDelete }, t('stop.action'))
+          : h(P.Button, { variant: 'outline', className: 'dsm-danger', disabled: busy, onClick: confirm }, t('confirm.action'))
       return h(P.Modal, {
         open: true,
         onClose: close,
@@ -161,12 +185,10 @@ window.__ModuleLoader__.load({
         description: t('confirm.desc', { title: request.displayTitle }),
         footer: h(React.Fragment, null,
           h(P.Button, { variant: 'outline', disabled: busy, onClick: close }, t('cancel')),
-          stage === 'stop'
-            ? h(P.Button, { variant: 'outline', className: 'dsm-danger', disabled: busy, onClick: stopDelete }, t('stop.action'))
-            : h(P.Button, { variant: 'outline', className: 'dsm-danger', disabled: busy, onClick: confirm }, t('confirm.action'))),
+          action),
       },
-      h('p', { className: 'dsm-note' }, stage === 'stop' ? t('stop.note') : t('confirm.note')),
-      busy && h('div', { className: 'dsm-status', role: 'status' }, stage === 'stop' ? t('stop.pending') : t('confirm.pending')),
+      h('p', { className: 'dsm-note' }, note),
+      busy && h('div', { className: 'dsm-status', role: 'status' }, t('confirm.pending')),
       error !== null && h('div', { className: 'dsm-error', role: 'alert' }, error))
     }
 
@@ -227,6 +249,26 @@ window.__ModuleLoader__.load({
         return value
       }
 
+      const sessionRunning = (sessionId) => sessions()?.list?.getSnapshot?.()?.byId?.[sessionId]?.running
+
+      /**
+       * 三段「强制删除」：二段超时且会话空闲（本页视角 running=否）时的
+       * 兜底出口——host 复查 agent 非运行后跳过 live 门直接删盘。内存里的
+       * 幽灵 agent 由 client 侧 handleSessionRemoved 即时摘行，进程重启后
+       * 彻底消失。
+       */
+      const forceDelete = async (sessionId) => {
+        const res = await withTimeout(svc().deleteSession(sessionId, false, true), 30_000, '强制删除会话')
+        const value = unwrap(res, null)
+        if (value === null) throw new Error(resError(res, '强制删除失败'))
+        const service = sessions()
+        if (service !== undefined && typeof service.handleSessionRemoved === 'function') {
+          try { service.handleSessionRemoved(sessionId) } catch { /* 摘行失败无害，重启后自然消失 */ }
+        }
+        refreshList()
+        return value
+      }
+
       const deleteSession = async (sessionId) => {
         const value = await callDelete(sessionId, false)
         refreshList()
@@ -281,6 +323,8 @@ window.__ModuleLoader__.load({
         },
         deleteSession,
         stopAndDelete,
+        forceDelete,
+        sessionRunning,
         isLiveRefusal,
       })
 
@@ -295,6 +339,8 @@ window.__ModuleLoader__.load({
           'stop.note': '该会话当前处于打开或运行状态。继续将停止其运行中的任务、关闭其打开的视图，然后永久删除磁盘日志（不可恢复）。若其任务停止较慢（如远程长命令）或另有别的标签页/窗口开着它，删除可能需要等待最多约一分钟。',
           'stop.action': '停止并永久删除',
           'stop.pending': '正在停止并删除…',
+          'force.note': '该会话空闲但一直无法正常离场（可能被别的标签页或某种后台机制持有）。强制删除将跳过占用检查直接删除磁盘日志（不可恢复）；侧栏的残留行会立即隐藏，内存中的残留会随 dsh web 重启彻底消失。',
+          'force.action': '强制删除（会话空闲）',
           cancel: '取消',
           close: '关闭',
         },
@@ -308,6 +354,8 @@ window.__ModuleLoader__.load({
           'stop.note': 'This session is currently open or running. Continuing will stop its running work, close its open view, then permanently remove the disk log (unrecoverable).',
           'stop.action': 'Stop and delete permanently',
           'stop.pending': 'Stopping and deleting…',
+          'force.note': 'The session is idle but could not retire (possibly held by another tab or a background mechanism). Force delete skips the liveness check and removes the disk log immediately (unrecoverable); the sidebar row hides at once and the in-memory remnant disappears on the next dsh web restart.',
+          'force.action': 'Force delete (idle)',
           cancel: 'Cancel',
           close: 'Close',
         },
