@@ -220,7 +220,8 @@ window.__ModuleLoader__.load({
       const isLiveRefusal = (message) => typeof message === 'string' && message.startsWith('[session-live]')
 
       const callDelete = async (sessionId, wait) => {
-        const res = await withTimeout(svc().deleteSession(sessionId, wait === true), wait ? 45_000 : 30_000, '删除会话')
+        // wait 模式下 host 最多轮询 60s，客户端保护线放到 75s。
+        const res = await withTimeout(svc().deleteSession(sessionId, wait === true), wait ? 75_000 : 30_000, '删除会话')
         const value = unwrap(res, null)
         if (value === null) throw new Error(resError(res, '删除会话失败'))
         return value
@@ -238,6 +239,9 @@ window.__ModuleLoader__.load({
        * 归档集自动关闭其主视图，客户端引用归零后 host 侧会话自然离场；
        * 随后以 wait=true 调本插件 host 端点，轮询等待离场后删除磁盘日志；
        * 最后清理归档集合残留（删除失败则回滚归档，保持会话可见可恢复）。
+       *
+       * host 等待超时时，错误里附带本页可见的持有状态（running/retainedBy），
+       * 帮助定位“谁还开着它”（最常见：另一个浏览器标签页或桌面端窗口）。
        */
       const stopAndDelete = async (sessionId) => {
         const workspaces = ctx.get('workspaces')
@@ -251,6 +255,14 @@ window.__ModuleLoader__.load({
           refreshList()
           return value
         } catch (error) {
+          if (isLiveRefusal(error instanceof Error ? error.message : String(error))) {
+            const row = sessions()?.list?.getSnapshot?.()?.byId?.[sessionId]
+            if (row !== undefined) {
+              const holders = Object.entries(row.retainedBy ?? {})
+                .map(([source, count]) => `${source}=${count}`).join(', ')
+              error.message += `〔本页视角：运行中=${row.running ? '是' : '否'}${holders === '' ? '' : `；持有方：${holders}`}〕`
+            }
+          }
           try { await workspaces.unarchiveSession(sessionId) } catch { /* 回滚尽力而为 */ }
           throw error
         }
@@ -280,7 +292,7 @@ window.__ModuleLoader__.load({
           'confirm.note': '该会话的完整对话记录将从磁盘日志中永久移除（不可恢复，回收站里也没有）。',
           'confirm.action': '永久删除',
           'confirm.pending': '正在删除…',
-          'stop.note': '该会话当前处于打开或运行状态。继续将停止其运行中的任务、关闭其打开的视图，然后永久删除磁盘日志（不可恢复）。',
+          'stop.note': '该会话当前处于打开或运行状态。继续将停止其运行中的任务、关闭其打开的视图，然后永久删除磁盘日志（不可恢复）。若其任务停止较慢（如远程长命令）或另有别的标签页/窗口开着它，删除可能需要等待最多约一分钟。',
           'stop.action': '停止并永久删除',
           'stop.pending': '正在停止并删除…',
           cancel: '取消',
