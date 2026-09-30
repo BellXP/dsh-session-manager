@@ -1,0 +1,7 @@
+# dsh-session-manager bundle patch: inserts the dual-face plugin row into the
+# profile roster. The node half (exports ".") exposes one Typert endpoint
+# (`session-manager/deleteSession`); the browser half (exports "./client")
+# adds the trash menu item on sidebar session rows plus the confirm dialog.
+- insert:
+    - id: session-manager
+      name: 'dsh-session-manager'
