@@ -242,8 +242,10 @@ window.__ModuleLoader__.load({
       const isLiveRefusal = (message) => typeof message === 'string' && message.startsWith('[session-live]')
 
       const callDelete = async (sessionId, wait) => {
+        // gateway 严格校验实参数 = host 描述符参数个数（3）：wait/force 必须
+        // 显式传布尔，不能靠 JS 省参。
         // wait 模式下 host 最多轮询 60s，客户端保护线放到 75s。
-        const res = await withTimeout(svc().deleteSession(sessionId, wait === true), wait ? 75_000 : 30_000, '删除会话')
+        const res = await withTimeout(svc().deleteSession(sessionId, wait === true, false), wait ? 75_000 : 30_000, '删除会话')
         const value = unwrap(res, null)
         if (value === null) throw new Error(resError(res, '删除会话失败'))
         return value
