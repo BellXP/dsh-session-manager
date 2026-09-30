@@ -14,12 +14,21 @@ DeepSeek Harness (DSH) Web GUI 的 **会话删除**：在侧栏会话行菜单�
 
 ## 安全边界（host 半）
 
-1. **live 会话拒绝删除**（AgentRegistry 仍挂载的会话需先停止）；
+1. **live 会话两段式**：直接删除 live（打开中/运行中）会话会被拒绝（消息带
+   `[session-live]` 前缀）；确认弹窗随即进入二段「停止并永久删除」——
+   - 先走**官方通道** `workspaces.archiveSession(id, {stopActivity:true})`：停掉
+     运行中的任务（turn/subagent/job/schedule），ui-workspace 监听归档集自动
+     关闭其主视图，客户端引用归零后 host 侧会话自然离场；
+   - 再以 `wait=true` 调删除端点：host 轮询等待会话离开注册表（最长 20s）后落删；
+   - 删除失败自动回滚归档，保持会话可见可恢复；
 2. 会话必须在持久化盘上存在（`sessionPersistence.list` 定位 header）；
 3. 目录路径由持久化层规范转义算法（`projectKey` + `encodeSegment`，与
    `@deepseek-ai/dsh-session-persistence-jsonl` 逐字一致）派生，并做
    「必须位于 sessions root 之内」包含性校验；
 4. 只删除该会话自己的目录；fork/子代理等派生会话不受影响（默认仅删选中的那个）。
+
+> 兼容性：已在 dsh **0.1.7-rc.2** 与 **0.2.0-rc.2** 上核对（路径算法、sessions root、
+> typert/主题/槽位/原语导出均一致）。本插件未声明 peerDependencies，不走版本门禁。
 
 ## 结构
 

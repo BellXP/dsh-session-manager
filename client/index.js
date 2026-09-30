@@ -35,7 +35,7 @@ window.__ModuleLoader__.load({
     }
     const CLIENT_TYPERT_REMOTE = {
       package: REMOTE_PACKAGE,
-      schemas: [{ name: 'sessionId', create: () => PASSTHROUGH_SCHEMA }],
+      schemas: ['sessionId', 'wait'].map((name) => ({ name, create: () => PASSTHROUGH_SCHEMA })),
       descriptors: [
         {
           id: REMOTE_PACKAGE + '#' + REMOTE_NAMESPACE + '/deleteSession',
@@ -45,6 +45,7 @@ window.__ModuleLoader__.load({
           invocation: { kind: 'direct' },
           parameters: [
             { name: 'sessionId', wire: 'sessionId', source: 'json', codec: paramCodec('sessionId') },
+            { name: 'wait', wire: 'wait', source: 'json', codec: paramCodec('wait') },
           ],
           result: { mode: 'src-json' },
         },
@@ -99,9 +100,10 @@ window.__ModuleLoader__.load({
 
     /**
      * shell.overlay 条目：无待确认请求时不渲染，否则一个 Modal。确认后调
-     * host 删除 → 刷新会话列表；取消则原样关闭。
+     * host 删除 → 刷新会话列表；live 拒绝时进入二段「停止并删除」；取消
+     * 则原样关闭。
      */
-    function SessionDeleteConfirmDialog({ useDeleteRequest, settleSessionDelete, deleteSession, t }) {
+    function SessionDeleteConfirmDialog({ useDeleteRequest, settleSessionDelete, deleteSession, stopAndDelete, isLiveRefusal, t }) {
       const request = useDeleteRequest((pending) => pending)
       if (request === null) return null
       return h(DeleteConfirmForm, {
@@ -109,26 +111,45 @@ window.__ModuleLoader__.load({
         request,
         settleSessionDelete,
         deleteSession,
+        stopAndDelete,
+        isLiveRefusal,
         t,
       })
     }
 
-    /** 单个请求的对话框：in-flight 与错误状态随其消亡。 */
-    function DeleteConfirmForm({ request, settleSessionDelete, deleteSession, t }) {
-      const [deleting, setDeleting] = useState(false)
+    /**
+     * 单个请求的对话框：in-flight 与错误状态随其消亡。两段式：
+     * confirm —— 常规确认；live 拒绝后进入 stop —— 「停止并永久删除」。
+     */
+    function DeleteConfirmForm({ request, settleSessionDelete, deleteSession, stopAndDelete, isLiveRefusal, t }) {
+      const [busy, setBusy] = useState(false)
+      const [stage, setStage] = useState('confirm')
       const [error, setError] = useState(null)
       const close = () => {
-        if (deleting) return
+        if (busy) return
         settleSessionDelete()
       }
       const confirm = () => {
-        setDeleting(true)
+        setBusy(true)
         setError(null)
         deleteSession(request.sessionId).then(() => {
-          setDeleting(false)
+          setBusy(false)
           settleSessionDelete()
         }).catch((reason) => {
-          setDeleting(false)
+          setBusy(false)
+          const message = reason instanceof Error ? reason.message : String(reason)
+          if (isLiveRefusal(message)) setStage('stop')
+          else setError(message)
+        })
+      }
+      const stopDelete = () => {
+        setBusy(true)
+        setError(null)
+        stopAndDelete(request.sessionId).then(() => {
+          setBusy(false)
+          settleSessionDelete()
+        }).catch((reason) => {
+          setBusy(false)
           setError(reason instanceof Error ? reason.message : String(reason))
         })
       }
@@ -139,11 +160,13 @@ window.__ModuleLoader__.load({
         title: t('confirm.title'),
         description: t('confirm.desc', { title: request.displayTitle }),
         footer: h(React.Fragment, null,
-          h(P.Button, { variant: 'outline', disabled: deleting, onClick: close }, t('cancel')),
-          h(P.Button, { variant: 'outline', className: 'dsm-danger', disabled: deleting, onClick: confirm }, t('confirm.action'))),
+          h(P.Button, { variant: 'outline', disabled: busy, onClick: close }, t('cancel')),
+          stage === 'stop'
+            ? h(P.Button, { variant: 'outline', className: 'dsm-danger', disabled: busy, onClick: stopDelete }, t('stop.action'))
+            : h(P.Button, { variant: 'outline', className: 'dsm-danger', disabled: busy, onClick: confirm }, t('confirm.action'))),
       },
-      h('p', { className: 'dsm-note' }, t('confirm.note')),
-      deleting && h('div', { className: 'dsm-status', role: 'status' }, t('confirm.pending')),
+      h('p', { className: 'dsm-note' }, stage === 'stop' ? t('stop.note') : t('confirm.note')),
+      busy && h('div', { className: 'dsm-status', role: 'status' }, stage === 'stop' ? t('stop.pending') : t('confirm.pending')),
       error !== null && h('div', { className: 'dsm-error', role: 'alert' }, error))
     }
 
@@ -193,12 +216,44 @@ window.__ModuleLoader__.load({
         try { void service.refresh() } catch { /* 刷新失败不影响删除结果本身 */ }
       }
 
-      const deleteSession = async (sessionId) => {
-        const res = await withTimeout(svc().deleteSession(sessionId), 30_000, '删除会话')
+      /** host 拒绝消息里的机器可识别前缀（live 会话两段式流程的判据）。 */
+      const isLiveRefusal = (message) => typeof message === 'string' && message.startsWith('[session-live]')
+
+      const callDelete = async (sessionId, wait) => {
+        const res = await withTimeout(svc().deleteSession(sessionId, wait === true), wait ? 45_000 : 30_000, '删除会话')
         const value = unwrap(res, null)
         if (value === null) throw new Error(resError(res, '删除会话失败'))
+        return value
+      }
+
+      const deleteSession = async (sessionId) => {
+        const value = await callDelete(sessionId, false)
         refreshList()
         return value
+      }
+
+      /**
+       * 二段式「停止并删除」：官方 workspaces 通道 `archiveSession(id,
+       * {stopActivity:true})` 停掉运行中的工作并归档 —— ui-workspace 监听
+       * 归档集自动关闭其主视图，客户端引用归零后 host 侧会话自然离场；
+       * 随后以 wait=true 调本插件 host 端点，轮询等待离场后删除磁盘日志；
+       * 最后清理归档集合残留（删除失败则回滚归档，保持会话可见可恢复）。
+       */
+      const stopAndDelete = async (sessionId) => {
+        const workspaces = ctx.get('workspaces')
+        if (workspaces === undefined || typeof workspaces.archiveSession !== 'function') {
+          throw new Error('workspaces 模型不可用，无法执行停止并删除 / workspaces model unavailable')
+        }
+        await workspaces.archiveSession(sessionId, { stopActivity: true })
+        try {
+          const value = await callDelete(sessionId, true)
+          try { await workspaces.unarchiveSession(sessionId) } catch { /* 会话已删，清理集合残留失败无害 */ }
+          refreshList()
+          return value
+        } catch (error) {
+          try { await workspaces.unarchiveSession(sessionId) } catch { /* 回滚尽力而为 */ }
+          throw error
+        }
       }
 
       const injected = () => ({
@@ -213,6 +268,8 @@ window.__ModuleLoader__.load({
           notifyRequest()
         },
         deleteSession,
+        stopAndDelete,
+        isLiveRefusal,
       })
 
       ctx.effect(() => ctx.locale.register('session-manager', {
@@ -220,9 +277,12 @@ window.__ModuleLoader__.load({
           'menu.delete': '删除会话…',
           'confirm.title': '删除会话',
           'confirm.desc': '将永久删除「{title}」',
-          'confirm.note': '该会话的完整对话记录将从磁盘日志中永久移除（不可恢复，回收站里也没有）。正在运行的会话需先停止才能删除。',
+          'confirm.note': '该会话的完整对话记录将从磁盘日志中永久移除（不可恢复，回收站里也没有）。',
           'confirm.action': '永久删除',
           'confirm.pending': '正在删除…',
+          'stop.note': '该会话当前处于打开或运行状态。继续将停止其运行中的任务、关闭其打开的视图，然后永久删除磁盘日志（不可恢复）。',
+          'stop.action': '停止并永久删除',
+          'stop.pending': '正在停止并删除…',
           cancel: '取消',
           close: '关闭',
         },
@@ -230,9 +290,12 @@ window.__ModuleLoader__.load({
           'menu.delete': 'Delete session…',
           'confirm.title': 'Delete session',
           'confirm.desc': 'Permanently delete "{title}"',
-          'confirm.note': 'The full conversation log of this session will be permanently removed from disk (unrecoverable, no trash). A running session must be stopped first.',
+          'confirm.note': 'The full conversation log of this session will be permanently removed from disk (unrecoverable, no trash).',
           'confirm.action': 'Delete permanently',
           'confirm.pending': 'Deleting…',
+          'stop.note': 'This session is currently open or running. Continuing will stop its running work, close its open view, then permanently remove the disk log (unrecoverable).',
+          'stop.action': 'Stop and delete permanently',
+          'stop.pending': 'Stopping and deleting…',
           cancel: 'Cancel',
           close: 'Close',
         },
