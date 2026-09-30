@@ -29,12 +29,35 @@ client/index.js  client 半：菜单项 + 确认弹窗 + 列表刷新
 cordis.patch.yml bundle 插入行
 ```
 
-host 半的运行时依赖（`@deepseek-ai/cordis`、`dsh-typert-protocol`、`dsh-home-paths`）
-通过 `node_modules/@deepseek-ai` junction 指向本机 dsh 安装的包树解析——与宿主进程
-共享同一份模块实例。克隆本仓库后，或 dsh 升级（npx 缓存目录变化）后，运行：
+## 平台支持（Windows / Linux / macOS）
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\link-dsh-deps.ps1
+插件代码本身零平台耦合：host 半只用 `node:fs`/`node:path` 与 `@deepseek-ai/dsh-home-paths`
+（遵循 `DSH_HOME` 环境变量），会话目录的转义算法（`projectKey` + `encodeSegment`）与官方
+持久化层逐字一致——Linux 上 `/home/user/proj` 同样正确产出 `--home-user-proj--`。唯一的
+平台差异是 host 半依赖的**布线方式**：
+
+| 平台 | 依赖布线 | 重建命令 |
+|---|---|---|
+| Windows | `node_modules/@deepseek-ai` **junction** → 本机 dsh 包树 | `powershell -ExecutionPolicy Bypass -File scripts\link-dsh-deps.ps1` |
+| Linux / macOS | `node_modules/@deepseek-ai` **symlink** → 本机 dsh 包树 | `bash scripts/link-dsh-deps.sh` |
+
+两个脚本都会自动探测 dsh 安装（npx 缓存 → npm 全局），也可显式指定安装根
+（`-DshRoot` / `-d`）。克隆后或 dsh 升级（npx 缓存目录变化）后重跑一次即可。
+
+另一条全平台通用的替代路线：在本仓库内用包管理器真实安装这三个依赖（如
+`pnpm add -D @deepseek-ai/cordis @deepseek-ai/dsh-typert-protocol @deepseek-ai/dsh-home-paths`），
+克隆即用、无需脚本，代价是与宿主进程各持一份模块实例（dsh-cloud-workspaces 即此模式，已被
+验证可用）。
+
+### Linux/macOS 安装进 profile
+
+```bash
+# ~/.dsh/profiles/web/package.json
+#   dependencies 增加 "dsh-session-manager": "link:/home/<user>/path/to/dsh-session-manager"
+#   dsh.profile.bundles 追加 'dsh-session-manager'
+cd ~/.dsh/profiles/web && pnpm install   # link: 依赖在 POSIX 上原生 symlink
+bash /path/to/dsh-session-manager/scripts/link-dsh-deps.sh
+# 重启 dsh web
 ```
 
 ## 安装（link 方式装入 web profile）
