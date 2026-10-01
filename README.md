@@ -57,6 +57,20 @@ cordis.patch.yml bundle 插入行
 两个脚本都会自动探测 dsh 安装（npx 缓存 → npm 全局），也可显式指定安装根
 （`-DshRoot` / `-d`）。克隆后或 dsh 升级（npx 缓存目录变化）后重跑一次即可。
 
+### 契约探针（升级雷达）
+
+升级 dsh 前跑一遍，断掉的契约会**按名字**报出来：
+
+```bash
+node scripts/check-dsh-contract.mjs              # 检查本仓库链接的 dsh 树
+node scripts/check-dsh-contract.mjs <dsh树>/@deepseek-ai   # 预检新版本树
+```
+
+覆盖：typert 通道、会话存储布局指纹（jsonl.zstd 分段）、`sidebar.workspaces.session.menu.item`
+与 `shell.overlay` 插槽、sessions `handleSessionRemoved`/`refresh`、workspaces
+`archiveSession`+`stopActivity`，以及 **projectKey 实测锚点**——用磁盘上观察到的真实目录名
+（win + posix cwd）锁死编码重实现，dsh 侧改算法时它会先红。
+
 另一条全平台通用的替代路线：在本仓库内用包管理器真实安装这三个依赖（如
 `pnpm add -D @deepseek-ai/cordis @deepseek-ai/dsh-typert-protocol @deepseek-ai/dsh-home-paths`），
 克隆即用、无需脚本，代价是与宿主进程各持一份模块实例（dsh-cloud-workspaces 即此模式，已被
