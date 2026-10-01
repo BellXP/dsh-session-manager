@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-manager",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Session deletion for the DeepSeek Harness Web GUI: a trash action on sidebar session rows that permanently removes the session's on-disk log directory (with a confirm dialog in the browser).",
   "type": "module",
   "exports": {
